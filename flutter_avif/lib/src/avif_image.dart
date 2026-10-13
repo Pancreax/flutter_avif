@@ -227,6 +227,8 @@ class AvifImage extends StatefulWidget {
 
 class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
   ImageStream? _imageStream;
+  ImageProvider? _resolvedImage;
+  ImageConfiguration? _resolvedConfiguration;
   ImageInfo? _imageInfo;
   bool _isListeningToStream = false;
   late bool _invertColors;
@@ -280,8 +282,6 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
       _imageStream!.removeListener(oldListener);
     }
     if (widget.image != oldWidget.image) {
-      final avifFfi = avif_platform.FlutterAvifPlatform.api;
-      avifFfi.disposeDecoder(key: oldWidget.image.hashCode.toString());
       _resolveImage();
     }
   }
@@ -296,7 +296,7 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
 
   @override
   void reassemble() {
-    _resolveImage();
+    _resolveImage(force: true);
     super.reassemble();
   }
 
@@ -369,15 +369,6 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
 
     _imageStream!.removeListener(_getListener());
     _isListeningToStream = false;
-
-    if (_imageStream?.completer != null &&
-        (_imageStream!.completer! is AvifImageStreamCompleter) &&
-        !(_imageStream!.completer! as AvifImageStreamCompleter)
-            .getHasListeners() &&
-        !PaintingBinding.instance.imageCache.containsKey(widget.image)) {
-      final avifFfi = avif_platform.FlutterAvifPlatform.api;
-      avifFfi.disposeDecoder(key: widget.image.hashCode.toString());
-    }
   }
 
   void _updateSourceStream(ImageStream newStream) {
@@ -414,18 +405,32 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
     _imageInfo = info;
   }
 
-  void _resolveImage() {
-    final ScrollAwareImageProvider provider = ScrollAwareImageProvider<Object>(
-      context: _scrollAwareContext,
-      imageProvider: widget.image,
-    );
-    final ImageStream newStream =
-        provider.resolve(createLocalImageConfiguration(
+  /// Keeps the current stream while the image and its configuration stay the
+  /// same. Resolving again only finds the same stream through the image cache;
+  /// with the cache off, a change of [TickerMode] would start a new decode,
+  /// replaying the animation.
+  void _resolveImage({bool force = false}) {
+    final configuration = createLocalImageConfiguration(
       context,
       size: widget.width != null && widget.height != null
           ? Size(widget.width!, widget.height!)
           : null,
-    ));
+    );
+    if (!force &&
+        _imageStream != null &&
+        _lastException == null &&
+        widget.image == _resolvedImage &&
+        configuration == _resolvedConfiguration) {
+      return;
+    }
+    _resolvedImage = widget.image;
+    _resolvedConfiguration = configuration;
+
+    final ScrollAwareImageProvider provider = ScrollAwareImageProvider<Object>(
+      context: _scrollAwareContext,
+      imageProvider: widget.image,
+    );
+    final ImageStream newStream = provider.resolve(configuration);
 
     _updateSourceStream(newStream);
   }
@@ -950,6 +955,10 @@ abstract class AvifCodec {
 }
 
 class MultiFrameAvifCodec implements AvifCodec {
+  /// Makes each codec's native decoder key unique: the native side reuses and
+  /// frees decoders by key, so two codecs of the same image must not share one.
+  static int _nextId = 0;
+
   final String _key;
   late Completer<void> _ready;
 
@@ -965,7 +974,7 @@ class MultiFrameAvifCodec implements AvifCodec {
     required int key,
     required Uint8List avifBytes,
     int? overrideDurationMs = -1,
-  }) : _key = key.toString() {
+  }) : _key = '$key-${_nextId++}' {
     _ready = Completer();
     try {
       final avifFfi = avif_platform.FlutterAvifPlatform.api;
@@ -1114,8 +1123,7 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
     Stream<ImageChunkEvent>? chunkEvents,
     InformationCollector? informationCollector,
   })  : _informationCollector = informationCollector,
-        _scale = scale,
-        _key = key {
+        _scale = scale {
     this.debugLabel = debugLabel;
     codec.then<void>(_handleCodecReady,
         onError: (Object error, StackTrace stack) {
@@ -1153,11 +1161,15 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
   Duration? _frameDuration;
   int _duration = 0;
   Timer? _timer;
-  final ImageProvider _key;
 
   bool _frameCallbackScheduled = false;
+  bool _isDisposed = false;
 
   void _handleCodecReady(AvifCodec codec) {
+    if (_isDisposed) {
+      codec.dispose();
+      return;
+    }
     _codec = codec;
     assert(_codec != null);
 
@@ -1180,7 +1192,7 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
       _frameDuration = _nextFrame!.duration;
       _nextFrame!.image.dispose();
       _nextFrame = null;
-      if (_codec!.durationMs == -1 || _codec!.durationMs > _duration) {
+      if (!_hasFinished) {
         _decodeNextFrameAndSchedule();
       }
       return;
@@ -1199,6 +1211,13 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
     return timestamp - _shownTimestamp >= _frameDuration!;
   }
 
+  /// An animation with a duration stops on its last frame. Decoding past it
+  /// would wrap the native decoder around to the first frame.
+  bool get _hasFinished =>
+      _currentFrame != null &&
+      _codec!.durationMs != -1 &&
+      _codec!.durationMs <= _duration;
+
   Future<void> _decodeNextFrameAndSchedule() async {
     _nextFrame?.image.dispose();
     _nextFrame = null;
@@ -1212,6 +1231,11 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
         informationCollector: _informationCollector,
         silent: true,
       );
+      return;
+    }
+    if (_isDisposed) {
+      _nextFrame?.image.dispose();
+      _nextFrame = null;
       return;
     }
     if (_codec!.frameCount == 1) {
@@ -1248,6 +1272,7 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
   void addListener(ImageStreamListener listener) {
     if (!hasListeners &&
         _codec != null &&
+        !_hasFinished &&
         (_currentFrame == null || _codec!.frameCount > 1)) {
       _decodeNextFrameAndSchedule();
     }
@@ -1277,26 +1302,18 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
     _chunkSubscription = null;
   }
 
+  /// Frees the native decoder only once nothing listens to or keeps this
+  /// stream alive, whether or not the image cache holds it.
   @override
-  ImageStreamCompleterHandle keepAlive() {
-    final handle = super.keepAlive();
-    return AvifImageStreamCompleterHandle(handle, this);
-  }
-}
-
-class AvifImageStreamCompleterHandle implements ImageStreamCompleterHandle {
-  final ImageStreamCompleterHandle _handle;
-  final AvifImageStreamCompleter _completer;
-
-  AvifImageStreamCompleterHandle(this._handle, this._completer);
-
-  @override
-  void dispose() {
-    _handle.dispose();
-    if (!_completer.getHasListeners() &&
-        !PaintingBinding.instance.imageCache.containsKey(_completer._key)) {
-      _completer._codec?.dispose();
-    }
+  void onDisposed() {
+    _isDisposed = true;
+    _timer?.cancel();
+    _timer = null;
+    _nextFrame?.image.dispose();
+    _nextFrame = null;
+    _currentFrame = null;
+    _codec?.dispose();
+    super.onDisposed();
   }
 }
 

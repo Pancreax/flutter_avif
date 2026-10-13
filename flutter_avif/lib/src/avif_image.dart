@@ -1163,6 +1163,7 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
   Timer? _timer;
 
   bool _frameCallbackScheduled = false;
+  bool _isDecodingFrame = false;
   bool _isDisposed = false;
 
   void _handleCodecReady(AvifCodec codec) {
@@ -1221,6 +1222,7 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
   Future<void> _decodeNextFrameAndSchedule() async {
     _nextFrame?.image.dispose();
     _nextFrame = null;
+    _isDecodingFrame = true;
     try {
       _nextFrame = await _codec!.getNextFrame();
     } catch (exception, stack) {
@@ -1232,6 +1234,8 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
         silent: true,
       );
       return;
+    } finally {
+      _isDecodingFrame = false;
     }
     if (_isDisposed) {
       _nextFrame?.image.dispose();
@@ -1274,9 +1278,20 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
         _codec != null &&
         !_hasFinished &&
         (_currentFrame == null || _codec!.frameCount > 1)) {
-      _decodeNextFrameAndSchedule();
+      _resumeFrames();
     }
     super.addListener(listener);
+  }
+
+  /// Picks the frames up where they stopped without a listener. A frame that
+  /// is decoding or waiting to show is the next one, so decoding another
+  /// would skip it and run the native decoder ahead of the duration.
+  void _resumeFrames() {
+    if (_nextFrame != null) {
+      _scheduleAppFrame();
+    } else if (!_isDecodingFrame) {
+      _decodeNextFrameAndSchedule();
+    }
   }
 
   @override

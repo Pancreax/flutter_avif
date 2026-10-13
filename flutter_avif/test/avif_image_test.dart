@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
@@ -162,6 +161,26 @@ void main() {
       await playThrough(tester);
 
       expect(shownHeights, [3]);
+      expect(codec.framesDecoded, 3);
+      completer.removeListener(listener);
+      handle.dispose();
+    });
+
+    testWidgets('shows each frame once when listened to again mid-animation',
+        (tester) async {
+      final completer = completerOf(codec);
+      completer.addListener(listener);
+      for (var i = 0; i < 5 && shownHeights.isEmpty; i++) {
+        await tester.pump();
+      }
+      final handle = completer.keepAlive();
+      completer.removeListener(listener);
+
+      completer.addListener(listener);
+      shownHeights.clear();
+      await playThrough(tester);
+
+      expect(shownHeights, [2, 3]);
       expect(codec.framesDecoded, 3);
       completer.removeListener(listener);
       handle.dispose();

@@ -426,10 +426,12 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
     _imageInfo = info;
   }
 
-  /// Keeps the current stream while this widget holds it and the image and its
-  /// configuration stay the same. Resolving again only finds the same stream
-  /// through the image cache; with the cache off, a change of [TickerMode]
-  /// would start a new decode, replaying the animation.
+  /// Keeps the current stream while this widget holds it, has shown a frame
+  /// from it, and the image and its configuration stay the same. Resolving
+  /// again only finds the same stream through the image cache; with the cache
+  /// off, a change of [TickerMode] would start a new decode, replaying the
+  /// animation. Before a first frame it resolves again, like Image, so a
+  /// provider that left the cache after failing gets another try.
   void _resolveImage({bool force = false}) {
     final configuration = createLocalImageConfiguration(
       context,
@@ -440,6 +442,7 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
     if (!force &&
         _imageStream != null &&
         (_isListeningToStream || _completerHandle != null) &&
+        _frameNumber != null &&
         _lastException == null &&
         widget.image == _resolvedImage &&
         configuration == _resolvedConfiguration) {
@@ -1144,10 +1147,10 @@ class AvifFrameInfo {
 }
 
 class AvifImageStreamCompleter extends ImageStreamCompleter {
-  /// [key] is unused, and kept so callers of the original constructor still
-  /// compile.
+  /// [key] is unused, and optional so callers of the original constructor
+  /// still compile.
   AvifImageStreamCompleter({
-    required ImageProvider key,
+    ImageProvider? key,
     required Future<AvifCodec> codec,
     required double scale,
     String? debugLabel,

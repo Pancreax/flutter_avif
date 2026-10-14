@@ -98,6 +98,37 @@ class _FakeAvifProvider extends ImageProvider<_FakeAvifProvider> {
   }
 }
 
+/// Fails its first load and leaves the image cache, like the file and network
+/// providers do, so a later resolve can try again.
+class _FailsOnceProvider extends ImageProvider<_FailsOnceProvider> {
+  _FailsOnceProvider(this.codec);
+
+  final _FakeCodec codec;
+  int loads = 0;
+
+  @override
+  Future<_FailsOnceProvider> obtainKey(ImageConfiguration configuration) =>
+      SynchronousFuture(this);
+
+  @override
+  ImageStreamCompleter loadImage(
+    _FailsOnceProvider key,
+    ImageDecoderCallback decode,
+  ) {
+    loads++;
+    return AvifImageStreamCompleter(codec: _load(key, loads), scale: 1);
+  }
+
+  Future<AvifCodec> _load(_FailsOnceProvider key, int load) async {
+    await Future<void>.value();
+    if (load == 1) {
+      PaintingBinding.instance.imageCache.evict(key);
+      throw StateError('Not there yet.');
+    }
+    return codec;
+  }
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -111,6 +142,11 @@ void main() {
       for (var i = 0; i < 3; i++)
         await createTestImage(width: 1, height: i + 1, cache: false),
     ];
+  });
+
+  setUp(() {
+    api.initialized.clear();
+    api.disposed.clear();
   });
 
   tearDownAll(() {
@@ -128,7 +164,6 @@ void main() {
   AvifImageStreamCompleter completerOf(FutureOr<AvifCodec> codec,
       {bool playOnce = false}) {
     return AvifImageStreamCompleter(
-      key: MemoryAvifImage(Uint8List(0)),
       codec: Future.value(codec),
       scale: 1,
       playOnce: playOnce,
@@ -434,6 +469,36 @@ void main() {
     expect(pausedHeight, 1);
     expect(first.codec.isDisposed, true);
     expect(second.loads, 1);
+    expect(tester.widget<RawImage>(find.byType(RawImage)).image!.height, 3);
+  });
+
+  testWidgets(
+      'AvifImage resolves a failed image again on the next dependency change',
+      (tester) async {
+    final provider = _FailsOnceProvider(_FakeCodec(frames, durationMs: 300));
+    final textScale = ValueNotifier(1.0);
+    addTearDown(textScale.dispose);
+    await tester.pumpWidget(
+      ValueListenableBuilder<double>(
+        valueListenable: textScale,
+        builder: (_, scale, __) => MediaQuery(
+          data: MediaQueryData(textScaler: TextScaler.linear(scale)),
+          child: AvifImage(
+            image: provider,
+            errorBuilder: (_, __, ___) => const Text('failed',
+                textDirection: TextDirection.ltr),
+          ),
+        ),
+      ),
+    );
+    await playThrough(tester);
+    expect(find.text('failed'), findsOneWidget);
+
+    textScale.value = 2;
+    await playThrough(tester);
+
+    expect(provider.loads, 2);
+    expect(find.text('failed'), findsNothing);
     expect(tester.widget<RawImage>(find.byType(RawImage)).image!.height, 3);
   });
 }

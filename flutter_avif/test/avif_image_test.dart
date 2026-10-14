@@ -121,11 +121,13 @@ void main() {
     }
   }
 
-  AvifImageStreamCompleter completerOf(FutureOr<AvifCodec> codec) {
+  AvifImageStreamCompleter completerOf(FutureOr<AvifCodec> codec,
+      {bool playOnce = false}) {
     return AvifImageStreamCompleter(
       key: MemoryAvifImage(Uint8List(0)),
       codec: Future.value(codec),
       scale: 1,
+      playOnce: playOnce,
     );
   }
 
@@ -221,6 +223,37 @@ void main() {
       completer.removeListener(listener);
     });
 
+    testWidgets(
+        'stops after one pass when it plays once, even if the duration runs past the frames',
+        (tester) async {
+      final longCodec = _FakeCodec(frames, durationMs: 500);
+      final completer = completerOf(longCodec, playOnce: true);
+
+      completer.addListener(listener);
+      await playThrough(tester);
+
+      expect(shownHeights, [1, 2, 3]);
+      expect(longCodec.framesDecoded, 3);
+      completer.removeListener(listener);
+    });
+
+    testWidgets('lets its last listener leave on the frame it shows',
+        (tester) async {
+      final completer = completerOf(codec);
+      late final ImageStreamListener leavesOnFirstFrame;
+      leavesOnFirstFrame = ImageStreamListener((info, _) {
+        info.dispose();
+        completer.removeListener(leavesOnFirstFrame);
+      });
+
+      completer.addListener(leavesOnFirstFrame);
+      await playThrough(tester);
+
+      expect(tester.takeException(), isNull);
+      expect(codec.framesDecoded, 1);
+      expect(codec.isDisposed, true);
+    });
+
     testWidgets('keeps its codec while a handle keeps it alive',
         (tester) async {
       final completer = completerOf(codec);
@@ -282,6 +315,42 @@ void main() {
     tickerEnabled.value = true;
     await playThrough(tester);
 
+    expect(provider.loads, 1);
+    expect(tester.widget<RawImage>(find.byType(RawImage)).image!.height, 3);
+  });
+
+  testWidgets(
+      'AvifImage shows an image mounted with its ticker off once the ticker turns on',
+      (tester) async {
+    final imageCache = PaintingBinding.instance.imageCache;
+    final maximumSize = imageCache.maximumSize;
+    addTearDown(() {
+      imageCache.clear();
+      imageCache.clearLiveImages();
+      imageCache.maximumSize = maximumSize;
+    });
+    imageCache.maximumSize = 0;
+    final provider = _FakeAvifProvider(_FakeCodec(frames, durationMs: 300));
+    final tickerEnabled = ValueNotifier(false);
+    addTearDown(tickerEnabled.dispose);
+    await tester.pumpWidget(
+      ValueListenableBuilder<bool>(
+        valueListenable: tickerEnabled,
+        builder: (_, enabled, __) => TickerMode(
+          enabled: enabled,
+          child: AvifImage(image: provider),
+        ),
+      ),
+    );
+    await playThrough(tester);
+    final pausedHeight =
+        tester.widget<RawImage>(find.byType(RawImage)).image?.height;
+
+    tickerEnabled.value = true;
+    await playThrough(tester);
+
+    expect(tester.takeException(), isNull);
+    expect(pausedHeight, 1);
     expect(provider.loads, 1);
     expect(tester.widget<RawImage>(find.byType(RawImage)).image!.height, 3);
   });

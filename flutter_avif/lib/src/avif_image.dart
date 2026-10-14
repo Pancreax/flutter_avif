@@ -227,6 +227,7 @@ class AvifImage extends StatefulWidget {
 
 class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
   ImageStream? _imageStream;
+  bool _isPaused = false;
   ImageProvider? _resolvedImage;
   ImageConfiguration? _resolvedConfiguration;
   ImageInfo? _imageInfo;
@@ -263,10 +264,13 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
     _updateInvertColors();
     _resolveImage();
 
-    if (TickerMode.of(context)) {
-      _listenToStream();
-    } else {
+    // Like Image: a paused widget still listens until its first frame, then
+    // keeps the stream alive, so it always holds the stream it shows.
+    _isPaused = !TickerMode.of(context);
+    if (_isPaused && _frameNumber != null) {
       _stopListeningToStream(keepStreamAlive: true);
+    } else {
+      _listenToStream();
     }
 
     super.didChangeDependencies();
@@ -337,6 +341,9 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
       _wasSynchronouslyLoaded = _wasSynchronouslyLoaded | synchronousCall;
       _loadingProgress = null;
     });
+    if (_isPaused) {
+      _stopListeningToStream(keepStreamAlive: true);
+    }
   }
 
   void _handleImageChunk(ImageChunkEvent event) {
@@ -348,14 +355,17 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
     });
   }
 
+  /// Listens before letting go of the handle, so the completer is never left
+  /// without either. A first frame delivered right away may stop listening
+  /// again and take a handle of its own.
   void _listenToStream() {
     if (_isListeningToStream) return;
 
-    _imageStream!.addListener(_getListener());
-    _completerHandle?.dispose();
-    _completerHandle = null;
-
     _isListeningToStream = true;
+    final handle = _completerHandle;
+    _completerHandle = null;
+    _imageStream!.addListener(_getListener());
+    handle?.dispose();
   }
 
   void _stopListeningToStream({bool keepStreamAlive = false}) {
@@ -405,10 +415,10 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
     _imageInfo = info;
   }
 
-  /// Keeps the current stream while the image and its configuration stay the
-  /// same. Resolving again only finds the same stream through the image cache;
-  /// with the cache off, a change of [TickerMode] would start a new decode,
-  /// replaying the animation.
+  /// Keeps the current stream while this widget holds it and the image and its
+  /// configuration stay the same. Resolving again only finds the same stream
+  /// through the image cache; with the cache off, a change of [TickerMode]
+  /// would start a new decode, replaying the animation.
   void _resolveImage({bool force = false}) {
     final configuration = createLocalImageConfiguration(
       context,
@@ -418,6 +428,7 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
     );
     if (!force &&
         _imageStream != null &&
+        (_isListeningToStream || _completerHandle != null) &&
         _lastException == null &&
         widget.image == _resolvedImage &&
         configuration == _resolvedConfiguration) {
@@ -542,6 +553,7 @@ class FileAvifImage extends ImageProvider<FileAvifImage> {
       key: key,
       codec: _loadAsync(key, decode),
       scale: key.scale,
+      playOnce: key.overrideDurationMs == null,
       debugLabel: key.file.path,
       informationCollector: () => <DiagnosticsNode>[
         ErrorDescription('Path: ${file.path}'),
@@ -665,6 +677,7 @@ class AssetAvifImage extends ImageProvider<AssetAvifImage> {
       key: key,
       codec: _loadAsync(key, decode),
       scale: key.scale,
+      playOnce: key.overrideDurationMs == null,
       debugLabel: key.asset,
       informationCollector: () => <DiagnosticsNode>[
         ErrorDescription('Asset: $asset'),
@@ -796,6 +809,7 @@ class NetworkAvifImage extends ImageProvider<NetworkAvifImage> {
         chunkEvents,
       ),
       scale: key.scale,
+      playOnce: key.overrideDurationMs == null,
       debugLabel: key.url,
       informationCollector: () => <DiagnosticsNode>[
         ErrorDescription('Url: $url'),
@@ -901,6 +915,7 @@ class MemoryAvifImage extends ImageProvider<MemoryAvifImage> {
       key: key,
       codec: _loadAsync(key, decode),
       scale: key.scale,
+      playOnce: key.overrideDurationMs == null,
       debugLabel: 'MemoryAvifImage(${describeIdentity(key.bytes)})',
     );
   }
@@ -1125,8 +1140,10 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
     String? debugLabel,
     Stream<ImageChunkEvent>? chunkEvents,
     InformationCollector? informationCollector,
+    bool playOnce = false,
   })  : _informationCollector = informationCollector,
-        _scale = scale {
+        _scale = scale,
+        _playOnce = playOnce {
     this.debugLabel = debugLabel;
     codec.then<void>(_handleCodecReady,
         onError: (Object error, StackTrace stack) {
@@ -1169,6 +1186,12 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
   bool _isDecodingFrame = false;
   bool _isDisposed = false;
 
+  /// Stops after one pass, on the last frame. The duration the file declares
+  /// can run past its frames, and decoding past the last frame wraps the
+  /// native decoder around to the first.
+  final bool _playOnce;
+  int _framesShown = 0;
+
   void _handleCodecReady(AvifCodec codec) {
     if (_isDisposed) {
       codec.dispose();
@@ -1192,6 +1215,10 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
         scale: _scale,
         debugLabel: debugLabel,
       ));
+      if (_isDisposed) {
+        // The last listener left on the frame just emitted.
+        return;
+      }
       _shownTimestamp = timestamp;
       _frameDuration = _nextFrame!.duration;
       _nextFrame!.image.dispose();
@@ -1218,11 +1245,13 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
   /// An animation with a duration stops on its last frame. Decoding past it
   /// would wrap the native decoder around to the first frame. Less than a
   /// millisecond left is the end: the duration is in whole milliseconds.
-  bool get _hasFinished =>
-      _currentFrame != null &&
-      _codec!.durationMs != -1 &&
-      Duration(milliseconds: _codec!.durationMs) - _elapsed <
-          const Duration(milliseconds: 1);
+  bool get _hasFinished {
+    if (_currentFrame == null) return false;
+    if (_playOnce) return _framesShown >= _codec!.frameCount;
+    return _codec!.durationMs != -1 &&
+        Duration(milliseconds: _codec!.durationMs) - _elapsed <
+            const Duration(milliseconds: 1);
+  }
 
   Future<void> _decodeNextFrameAndSchedule() async {
     _nextFrame?.image.dispose();
@@ -1256,6 +1285,9 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
         scale: _scale,
         debugLabel: debugLabel,
       ));
+      if (_isDisposed) {
+        return;
+      }
       _nextFrame!.image.dispose();
       _nextFrame = null;
       return;
@@ -1273,8 +1305,9 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
   }
 
   void _emitFrame(ImageInfo imageInfo) {
-    setImage(imageInfo);
+    _framesShown++;
     _elapsed += _nextFrame?.duration ?? Duration.zero;
+    setImage(imageInfo);
   }
 
   @override

@@ -6,6 +6,7 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_avif/flutter_avif.dart';
 import 'package:flutter_avif_platform_interface/flutter_avif_platform_interface.dart';
 import 'package:flutter_avif_platform_interface/models/avif_info.pb.dart';
+import 'package:flutter_avif_platform_interface/models/frame.pb.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 class _FakeAvifApi implements FlutterAvif {
@@ -27,6 +28,11 @@ class _FakeAvifApi implements FlutterAvif {
     return true;
   }
 
+  /// One transparent pixel lasting 1/30 s.
+  @override
+  Future<Frame> getNextFrame({required String key}) async =>
+      Frame(data: [0, 0, 0, 0], width: 1, height: 1, duration: 1 / 30);
+
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
@@ -34,9 +40,14 @@ class _FakeAvifApi implements FlutterAvif {
 /// Plays [frames] in order, wrapping around after the last one like the
 /// native decoder does.
 class _FakeCodec implements AvifCodec {
-  _FakeCodec(this.frames, {required this.durationMs});
+  _FakeCodec(
+    this.frames, {
+    required this.durationMs,
+    this.frameDuration = const Duration(milliseconds: 100),
+  });
 
   final List<ui.Image> frames;
+  final Duration frameDuration;
   int framesDecoded = 0;
   bool isDisposed = false;
 
@@ -52,10 +63,7 @@ class _FakeCodec implements AvifCodec {
   @override
   Future<AvifFrameInfo> getNextFrame() async {
     final image = frames[framesDecoded++ % frames.length];
-    return AvifFrameInfo(
-      duration: const Duration(milliseconds: 100),
-      image: image.clone(),
-    );
+    return AvifFrameInfo(duration: frameDuration, image: image.clone());
   }
 
   @override
@@ -133,6 +141,17 @@ void main() {
     expect(api.disposed, [api.initialized.first]);
   });
 
+  test('keeps frame durations below the millisecond', () async {
+    final codec = MultiFrameAvifCodec(key: 8, avifBytes: Uint8List(0));
+    await codec.ready();
+
+    final frame = await codec.getNextFrame();
+
+    expect(frame.duration, const Duration(microseconds: 33333));
+    frame.image.dispose();
+    codec.dispose();
+  });
+
   group('AvifImageStreamCompleter', () {
     late _FakeCodec codec;
     late List<int> shownHeights;
@@ -184,6 +203,22 @@ void main() {
       expect(codec.framesDecoded, 3);
       completer.removeListener(listener);
       handle.dispose();
+    });
+
+    testWidgets(
+        'stops on the last frame when the frames round down to less than the duration',
+        (tester) async {
+      // Three frames of 1/30 s: 99 ms in whole milliseconds, 100 ms in the file.
+      final roundingCodec = _FakeCodec(frames,
+          durationMs: 100, frameDuration: const Duration(microseconds: 33333));
+      final completer = completerOf(roundingCodec);
+
+      completer.addListener(listener);
+      await playThrough(tester);
+
+      expect(shownHeights, [1, 2, 3]);
+      expect(roundingCodec.framesDecoded, 3);
+      completer.removeListener(listener);
     });
 
     testWidgets('keeps its codec while a handle keeps it alive',

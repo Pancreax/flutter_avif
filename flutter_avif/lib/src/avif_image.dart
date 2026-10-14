@@ -1000,14 +1000,14 @@ class MultiFrameAvifCodec implements AvifCodec {
   Future<AvifFrameInfo> getNextFrame() async {
     final Completer<AvifFrameInfo> completer = Completer<AvifFrameInfo>.sync();
     final String? error =
-        _getNextFrame((ui.Image? image, int durationMilliseconds) {
+        _getNextFrame((ui.Image? image, int durationMicroseconds) {
       if (image == null) {
         completer.completeError(Exception(
             'Codec failed to produce an image, possibly due to invalid image data.'));
       } else {
         completer.complete(AvifFrameInfo(
           image: image,
-          duration: Duration(milliseconds: durationMilliseconds),
+          duration: Duration(microseconds: durationMicroseconds),
         ));
       }
     });
@@ -1027,7 +1027,10 @@ class MultiFrameAvifCodec implements AvifCodec {
           frame.height,
           ui.PixelFormat.rgba8888,
           (image) {
-            callback(image, (frame.duration * 1000).round());
+            // Microseconds keep the sum of the frames close to the file's
+            // duration; rounding each frame to milliseconds can fall short.
+            callback(image,
+                (frame.duration * Duration.microsecondsPerSecond).round());
           },
         );
       });
@@ -1159,7 +1162,7 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
   ImageInfo? _currentFrame;
   late Duration _shownTimestamp;
   Duration? _frameDuration;
-  int _duration = 0;
+  Duration _elapsed = Duration.zero;
   Timer? _timer;
 
   bool _frameCallbackScheduled = false;
@@ -1213,11 +1216,13 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
   }
 
   /// An animation with a duration stops on its last frame. Decoding past it
-  /// would wrap the native decoder around to the first frame.
+  /// would wrap the native decoder around to the first frame. Less than a
+  /// millisecond left is the end: the duration is in whole milliseconds.
   bool get _hasFinished =>
       _currentFrame != null &&
       _codec!.durationMs != -1 &&
-      _codec!.durationMs <= _duration;
+      Duration(milliseconds: _codec!.durationMs) - _elapsed <
+          const Duration(milliseconds: 1);
 
   Future<void> _decodeNextFrameAndSchedule() async {
     _nextFrame?.image.dispose();
@@ -1269,7 +1274,7 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
 
   void _emitFrame(ImageInfo imageInfo) {
     setImage(imageInfo);
-    _duration += _nextFrame?.duration.inMilliseconds ?? 0;
+    _elapsed += _nextFrame?.duration ?? Duration.zero;
   }
 
   @override

@@ -51,6 +51,9 @@ class _FakeCodec implements AvifCodec {
   int framesDecoded = 0;
   bool isDisposed = false;
 
+  /// Holds each decode until completed, when set.
+  Completer<void>? gate;
+
   @override
   final int durationMs;
 
@@ -63,6 +66,7 @@ class _FakeCodec implements AvifCodec {
   @override
   Future<AvifFrameInfo> getNextFrame() async {
     final image = frames[framesDecoded++ % frames.length];
+    await gate?.future;
     return AvifFrameInfo(duration: frameDuration, image: image.clone());
   }
 
@@ -254,6 +258,37 @@ void main() {
       expect(codec.isDisposed, true);
     });
 
+    testWidgets('does not decode for a listener added after it was disposed',
+        (tester) async {
+      final completer = completerOf(codec);
+      completer.addListener(listener);
+      await tester.pump();
+      completer.removeListener(listener);
+      final framesBeforeDisposal = codec.framesDecoded;
+
+      expect(() => completer.addListener(listener), throwsStateError);
+      expect(codec.isDisposed, true);
+      expect(codec.framesDecoded, framesBeforeDisposal);
+    });
+
+    testWidgets('frees its codec only once a decode in flight returns',
+        (tester) async {
+      final gate = Completer<void>();
+      codec.gate = gate;
+      final completer = completerOf(codec);
+      completer.addListener(listener);
+      await tester.pump();
+      completer.removeListener(listener);
+      final disposedWhileDecoding = codec.isDisposed;
+
+      gate.complete();
+      await tester.pump();
+
+      expect(disposedWhileDecoding, false);
+      expect(codec.isDisposed, true);
+      expect(tester.takeException(), isNull);
+    });
+
     testWidgets('keeps its codec while a handle keeps it alive',
         (tester) async {
       final completer = completerOf(codec);
@@ -352,6 +387,53 @@ void main() {
     expect(tester.takeException(), isNull);
     expect(pausedHeight, 1);
     expect(provider.loads, 1);
+    expect(tester.widget<RawImage>(find.byType(RawImage)).image!.height, 3);
+  });
+
+  testWidgets(
+      'AvifImage shows a new image set while its ticker is off once the ticker turns on',
+      (tester) async {
+    final imageCache = PaintingBinding.instance.imageCache;
+    final maximumSize = imageCache.maximumSize;
+    addTearDown(() {
+      imageCache.clear();
+      imageCache.clearLiveImages();
+      imageCache.maximumSize = maximumSize;
+    });
+    imageCache.maximumSize = 0;
+    final first = _FakeAvifProvider(_FakeCodec(frames, durationMs: 300));
+    final second = _FakeAvifProvider(_FakeCodec(frames, durationMs: 300));
+    final tickerEnabled = ValueNotifier(true);
+    final image = ValueNotifier(first);
+    addTearDown(tickerEnabled.dispose);
+    addTearDown(image.dispose);
+    await tester.pumpWidget(
+      ValueListenableBuilder<bool>(
+        valueListenable: tickerEnabled,
+        builder: (_, enabled, __) => ValueListenableBuilder<_FakeAvifProvider>(
+          valueListenable: image,
+          builder: (_, provider, __) => TickerMode(
+            enabled: enabled,
+            child: AvifImage(image: provider),
+          ),
+        ),
+      ),
+    );
+    await playThrough(tester);
+    tickerEnabled.value = false;
+    await tester.pump();
+
+    image.value = second;
+    await playThrough(tester);
+    final pausedHeight =
+        tester.widget<RawImage>(find.byType(RawImage)).image?.height;
+    tickerEnabled.value = true;
+    await playThrough(tester);
+
+    expect(tester.takeException(), isNull);
+    expect(pausedHeight, 1);
+    expect(first.codec.isDisposed, true);
+    expect(second.loads, 1);
     expect(tester.widget<RawImage>(find.byType(RawImage)).image!.height, 3);
   });
 }

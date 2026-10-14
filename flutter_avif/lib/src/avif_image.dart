@@ -263,17 +263,20 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
   void didChangeDependencies() {
     _updateInvertColors();
     _resolveImage();
-
-    // Like Image: a paused widget still listens until its first frame, then
-    // keeps the stream alive, so it always holds the stream it shows.
     _isPaused = !TickerMode.of(context);
+    _holdStream();
+
+    super.didChangeDependencies();
+  }
+
+  /// Like Image: a paused widget still listens until its first frame, then
+  /// keeps the stream alive, so it always holds the stream it shows.
+  void _holdStream() {
     if (_isPaused && _frameNumber != null) {
       _stopListeningToStream(keepStreamAlive: true);
     } else {
       _listenToStream();
     }
-
-    super.didChangeDependencies();
   }
 
   @override
@@ -287,6 +290,7 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
     }
     if (widget.image != oldWidget.image) {
       _resolveImage();
+      _holdStream();
     }
   }
 
@@ -301,6 +305,7 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
   @override
   void reassemble() {
     _resolveImage(force: true);
+    _holdStream();
     super.reassemble();
   }
 
@@ -364,8 +369,11 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
     _isListeningToStream = true;
     final handle = _completerHandle;
     _completerHandle = null;
-    _imageStream!.addListener(_getListener());
-    handle?.dispose();
+    try {
+      _imageStream!.addListener(_getListener());
+    } finally {
+      handle?.dispose();
+    }
   }
 
   void _stopListeningToStream({bool keepStreamAlive = false}) {
@@ -385,6 +393,9 @@ class AvifImageState extends State<AvifImage> with WidgetsBindingObserver {
     if (_imageStream?.key == newStream.key) return;
 
     if (_isListeningToStream) _imageStream!.removeListener(_getListener());
+    // The handle kept the previous stream alive, not the new one.
+    _completerHandle?.dispose();
+    _completerHandle = null;
 
     if (!widget.gaplessPlayback) {
       setState(() {
@@ -1133,6 +1144,8 @@ class AvifFrameInfo {
 }
 
 class AvifImageStreamCompleter extends ImageStreamCompleter {
+  /// [key] is unused, and kept so callers of the original constructor still
+  /// compile.
   AvifImageStreamCompleter({
     required ImageProvider key,
     required Future<AvifCodec> codec,
@@ -1254,29 +1267,36 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
   }
 
   Future<void> _decodeNextFrameAndSchedule() async {
+    final codec = _codec!;
     _nextFrame?.image.dispose();
     _nextFrame = null;
     _isDecodingFrame = true;
     try {
-      _nextFrame = await _codec!.getNextFrame();
+      _nextFrame = await codec.getNextFrame();
     } catch (exception, stack) {
-      reportError(
-        context: ErrorDescription('resolving an image frame'),
-        exception: exception,
-        stack: stack,
-        informationCollector: _informationCollector,
-        silent: true,
-      );
+      if (!_isDisposed) {
+        reportError(
+          context: ErrorDescription('resolving an image frame'),
+          exception: exception,
+          stack: stack,
+          informationCollector: _informationCollector,
+          silent: true,
+        );
+      }
       return;
     } finally {
       _isDecodingFrame = false;
+      if (_isDisposed) {
+        // onDisposed left the codec to this decode, which was still using it.
+        codec.dispose();
+      }
     }
     if (_isDisposed) {
       _nextFrame?.image.dispose();
       _nextFrame = null;
       return;
     }
-    if (_codec!.frameCount == 1) {
+    if (codec.frameCount == 1) {
       if (!hasListeners) {
         return;
       }
@@ -1356,7 +1376,9 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
   }
 
   /// Frees the native decoder only once nothing listens to or keeps this
-  /// stream alive, whether or not the image cache holds it.
+  /// stream alive, whether or not the image cache holds it. A decode still in
+  /// flight frees it when it returns, so the native side never loses a
+  /// decoder in use.
   @override
   void onDisposed() {
     _isDisposed = true;
@@ -1365,7 +1387,11 @@ class AvifImageStreamCompleter extends ImageStreamCompleter {
     _nextFrame?.image.dispose();
     _nextFrame = null;
     _currentFrame = null;
-    _codec?.dispose();
+    if (!_isDecodingFrame) {
+      _codec?.dispose();
+    }
+    _codec = null;
+    dispose();
     super.onDisposed();
   }
 }

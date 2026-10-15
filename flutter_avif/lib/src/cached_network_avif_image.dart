@@ -63,6 +63,7 @@ class CachedNetworkAvifImageProvider extends NetworkAvifImage {
         chunkEvents,
       ),
       scale: key.scale,
+      playOnce: key.overrideDurationMs == null,
       debugLabel: key.url,
       informationCollector: () => <DiagnosticsNode>[
         ErrorDescription('Url: $url'),
